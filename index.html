@@ -144,6 +144,7 @@ img{display:block;max-width:100%}
 .msg:hover .msg-acts,.msg-acts.show{opacity:1}
 .msg-acts button{font-size:10.5px;color:var(--muted);padding:4px 9px;border-radius:6px;transition:.15s;display:flex;align-items:center;gap:5px}
 .msg-acts button:hover{background:var(--surface-2);color:var(--text)}
+.msg-acts button.speaking{background:rgba(255,92,108,.15);color:var(--danger)}
 .msg-acts svg{width:12px;height:12px}
 
 .thinking{display:flex;align-items:center;gap:9px;padding:4px 0}
@@ -493,18 +494,17 @@ img{display:block;max-width:100%}
 
 <script>
 /* ============================================================
-   ZISHU AI v2.3
-   New in 2.3:
-   - Line-by-line streaming (fast in coding mode)
-   - System theme on first launch
-   - Auto free-model detection per provider
-   - Expanded time-aware welcome messages
+   ZISHU AI v2.4
+   New in 2.4:
+   - TTS clean: strips *, #, _, backticks, emojis, markdown, URLs,
+     code blocks — speaks only natural text.
+   - Listen button toggles: tap again while speaking → stops.
    ============================================================ */
 
 const APP = {
   name: 'ZISHU AI',
   company: 'ZISHU TRON',
-  version: '2.3.0',
+  version: '2.4.0',
   defaultSystem: `You are ZISHU AI, a professional AI workspace assistant by ZISHU TRON.
 
 STRICT LANGUAGE RULE:
@@ -619,11 +619,7 @@ async function loadAll(){
   if(Array.isArray(provs)) State.providers=provs;
   if(settings && typeof settings==='object') State.settings={...State.settings,...settings};
   if(Array.isArray(memory)) State.settings.memory=memory;
-
-  // Apply theme: if 'system', read system preference
-  if(State.settings.theme==='system'){
-    State.settings.theme = matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
-  }
+  if(State.settings.theme==='system') State.settings.theme = matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
   applyTheme(State.settings.theme);
 }
 
@@ -647,6 +643,7 @@ const Icons = {
   copy:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>',
   regen:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15"/></svg>',
   listen:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 010 7.07M19.07 4.93a10 10 0 010 14.14"/></svg>',
+  stop:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
   edit:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
   rename:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
   del:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6"/></svg>',
@@ -815,33 +812,16 @@ const AIRequestManager = {
     }catch(e){ return {ok:false, error:e.friendly||e.message}; }
   },
 
-  /* ===== AUTO FREE MODEL DETECTION =====
-     Strategy:
-     1. Try provider's known autoFree model (catalog default).
-     2. If models list is available, prefer a model with ':free' in ID,
-        then a small/fast model (mini, flash, small, 7b, 8b),
-        then any model.
-  */
   async detectFreeModel(provider){
     const cfg = PROVIDER_CATALOG[provider.type] || PROVIDER_CATALOG.custom;
-    // 1. Catalog default
     if(cfg.autoFree) return cfg.autoFree;
-
-    // 2. Try listing models
     const models = await this.listModels(provider);
     if(!models.length) return null;
-
     const ids = models.map(m=>m.id);
-
-    // Prefer explicit ':free' models (OpenRouter style)
     const free = ids.find(id => /:free$/i.test(id));
     if(free) return free;
-
-    // Prefer small/fast models
     const small = ids.find(id => /mini|flash|haiku|small|7b|8b|instant|turbo/i.test(id));
     if(small) return small;
-
-    // Otherwise first model
     return ids[0];
   }
 };
@@ -1132,8 +1112,12 @@ const Files = {
   clear(){ State.attachments=[]; Composer.renderAttachments(); }
 };
 
+/* ============ VOICE (TTS clean + toggle) ============ */
 const Voice = {
   rec:null,
+  speaking:false,     // whether TTS is currently active
+  currentBtn:null,    // the button that started speaking
+
   toggle(e){
     e?.stopPropagation();
     const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
@@ -1149,15 +1133,116 @@ const Voice = {
     document.getElementById('voice-tool')?.classList.add('on');
     UI.toast('Listening…');
   },
+
+  /* Strip markdown, code, emojis, symbols — keep only natural text for TTS */
+  cleanForSpeech(text){
+    if(!text) return '';
+    let s = String(text);
+
+    // Remove fenced code blocks entirely
+    s = s.replace(/```[\s\S]*?```/g, ' ');
+    // Remove inline code (but keep the content, it's often meaningful)
+    s = s.replace(/`([^`]+)`/g, '$1');
+    // Remove markdown links, keep the label
+    s = s.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+    // Remove raw URLs
+    s = s.replace(/https?:\/\/\S+/gi, ' ');
+    // Remove markdown headings markers
+    s = s.replace(/^#{1,6}\s+/gm, '');
+    // Remove bold/italic markers
+    s = s.replace(/\*\*([^*]+)\*\*/g, '$1');
+    s = s.replace(/\*([^*]+)\*/g, '$1');
+    s = s.replace(/__([^_]+)__/g, '$1');
+    s = s.replace(/_([^_]+)_/g, '$1');
+    // Remove strikethrough
+    s = s.replace(/~~([^~]+)~~/g, '$1');
+    // Remove blockquote markers
+    s = s.replace(/^\s*>\s?/gm, '');
+    // Remove list markers (-, *, +, numbers)
+    s = s.replace(/^\s*[-*+]\s+/gm, '');
+    s = s.replace(/^\s*\d+\.\s+/gm, '');
+    // Remove horizontal rules
+    s = s.replace(/^\s*[-*_]{3,}\s*$/gm, ' ');
+    // Remove table pipes
+    s = s.replace(/\|/g, ' ');
+    // Remove remaining asterisks, underscores, hashes, backticks, tildes
+    s = s.replace(/[*_#`~]+/g, ' ');
+    // Remove emojis (broad unicode ranges + variation selectors + ZWJ)
+    s = s.replace(/[\u{1F300}-\u{1FAFF}]/gu, ' ');
+    s = s.replace(/[\u{1F000}-\u{1F2FF}]/gu, ' ');
+    s = s.replace(/[\u{2600}-\u{27BF}]/gu, ' ');
+    s = s.replace(/[\u{2190}-\u{21FF}]/gu, ' ');
+    s = s.replace(/[\u{2B00}-\u{2BFF}]/gu, ' ');
+    s = s.replace(/[\u{FE00}-\u{FE0F}]/gu, '');
+    s = s.replace(/\u200D/g, '');
+    // Remove decorative symbols like ⚠ ✅ ❌ ● ○ ◆ ■ □ ★ ☆
+    s = s.replace(/[⚠✅❌●○◆■□★☆✦✧▶◀▲▼→←↑↓•·…]/g, ' ');
+    // Collapse whitespace
+    s = s.replace(/\s+/g, ' ').trim();
+
+    // Cap length to avoid super long TTS
+    if(s.length > 3000) s = s.slice(0, 3000) + '…';
+    return s;
+  },
+
+  /* Called by the Listen button in message actions */
+  speakFromButton(text, btn){
+    // If already speaking — stop
+    if(this.speaking){
+      this.stopSpeaking();
+      return;
+    }
+    if(!('speechSynthesis' in window)) return UI.toast('TTS not supported','err');
+
+    const clean = this.cleanForSpeech(text);
+    if(!clean){ UI.toast('Nothing to read','err'); return; }
+
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(clean);
+    u.lang = State.settings.voiceLang || 'en-US';
+    u.rate = 0.95;
+
+    u.onstart = ()=>{
+      this.speaking = true;
+      this.currentBtn = btn;
+      if(btn){
+        btn.classList.add('speaking');
+        btn.innerHTML = Icons.stop + ' Stop';
+      }
+    };
+    u.onend = u.onerror = ()=>{
+      this.speaking = false;
+      if(this.currentBtn){
+        this.currentBtn.classList.remove('speaking');
+        this.currentBtn.innerHTML = Icons.listen + ' Listen';
+        this.currentBtn = null;
+      }
+    };
+
+    speechSynthesis.speak(u);
+  },
+
+  stopSpeaking(){
+    speechSynthesis.cancel();
+    this.speaking = false;
+    if(this.currentBtn){
+      this.currentBtn.classList.remove('speaking');
+      this.currentBtn.innerHTML = Icons.listen + ' Listen';
+      this.currentBtn = null;
+    }
+  },
+
+  /* legacy API used in a few places */
   speak(text){
     if(!('speechSynthesis' in window)) return UI.toast('TTS not supported','err');
+    const clean = this.cleanForSpeech(text);
     speechSynthesis.cancel();
-    const u=new SpeechSynthesisUtterance(text.slice(0,3000));
+    const u=new SpeechSynthesisUtterance(clean);
     u.lang=State.settings.voiceLang||'en-US';
     u.rate=0.95;
     speechSynthesis.speak(u);
   },
-  stop(){ speechSynthesis.cancel(); }
+  stop(){ this.stopSpeaking(); }
 };
 
 const Composer = {
@@ -1356,19 +1441,11 @@ const Chat = {
     </div>`;
   },
 
-  /* ===== TIME-AWARE GREETING =====
-     Uses the device's local time. Different messages per day + per time of day.
-  */
   greeting(){
     const now=new Date();
     const h=now.getHours();
-    let timeGreet;
-    if(h>=5 && h<12) timeGreet='Good morning';
-    else if(h>=12 && h<17) timeGreet='Good afternoon';
-    else if(h>=17 && h<21) timeGreet='Good evening';
-    else timeGreet='Good night';
-
-    const morning=[
+    let pool;
+    if(h>=5 && h<12) pool=[
       'Good morning! Ready to make today productive?',
       'Good morning! What shall we explore first?',
       'Good morning! Fresh start — how can I help?',
@@ -1376,7 +1453,7 @@ const Chat = {
       'Good morning! What can I do for you today?',
       'Good morning! Your workspace is ready.'
     ];
-    const afternoon=[
+    else if(h>=12 && h<17) pool=[
       'Good afternoon! What can I help you with?',
       'Good afternoon! Ready to dive into something new?',
       'Good afternoon! Let\'s get things done.',
@@ -1384,7 +1461,7 @@ const Chat = {
       'Good afternoon! How may I assist you?',
       'Good afternoon! Your AI workspace is ready.'
     ];
-    const evening=[
+    else if(h>=17 && h<21) pool=[
       'Good evening! How can I help you tonight?',
       'Good evening! Let\'s wrap up the day productively.',
       'Good evening! What would you like to work on?',
@@ -1392,7 +1469,7 @@ const Chat = {
       'Good evening! How may I assist you?',
       'Good evening! Let\'s create something great.'
     ];
-    const night=[
+    else pool=[
       'Good night! Working late? I\'m here to help.',
       'Good night! What can I do for you?',
       'Good night! Let\'s get this done quietly.',
@@ -1400,13 +1477,6 @@ const Chat = {
       'Good night! How can I assist you?',
       'Good night! Ready to help whenever you need.'
     ];
-
-    let pool;
-    if(h>=5 && h<12) pool=morning;
-    else if(h>=12 && h<17) pool=afternoon;
-    else if(h>=17 && h<21) pool=evening;
-    else pool=night;
-
     const dayIndex=Math.floor(Date.now()/86400000);
     return pool[dayIndex % pool.length];
   },
@@ -1452,7 +1522,7 @@ const Chat = {
     return `<div class="msg-acts ${m.status==='streaming'?'':'show'}">
       <button onclick="Chat.copyMsg(${i})">${Icons.copy} Copy</button>
       <button onclick="Chat.regen(${i})">${Icons.regen} Regenerate</button>
-      <button onclick="Chat.speak(${i})">${Icons.listen} Listen</button>
+      <button class="listen-btn" onclick="Chat.listen(${i}, this)">${Icons.listen} Listen</button>
       ${m.rawHTML?`<button onclick="Workspace.showArtifact(State.chats[State.currentId].messages[${i}].rawHTML)">${Icons.play} Open artifact</button>`:''}
     </div>`;
   },
@@ -1461,7 +1531,12 @@ const Chat = {
     const m=this.current()?.messages[i]; if(!m) return;
     navigator.clipboard.writeText(m.content||'').then(()=>UI.toast('Copied','ok'));
   },
-  speak(i){ const m=this.current()?.messages[i]; if(!m) return; Voice.speak(m.content||''); },
+
+  /* Listen button handler — toggles speaking */
+  listen(i, btn){
+    const m=this.current()?.messages[i]; if(!m) return;
+    Voice.speakFromButton(m.content||'', btn);
+  },
 
   edit(i){
     const c=this.current(); if(!c) return;
@@ -1491,6 +1566,9 @@ const Chat = {
 
   async send(opts={}){
     if(State.busy) return;
+    // Stop any TTS that's playing
+    Voice.stopSpeaking();
+
     const input=document.getElementById('input');
     const text=input.value.trim();
     const isRegen = opts.regenerate === true;
@@ -1571,10 +1649,6 @@ const Chat = {
         full=acc;
         aiMsg.content=full;
         aiMsg.rendered=null;
-        /* Line-by-line streaming:
-           - In coding mode: render instantly on every delta (fast, full code visible quickly).
-           - In normal mode: update DOM per line, so user sees text line-by-line.
-        */
         if(isCodingMode){
           this.streamUpdateFast(aiIdx, full);
         } else {
@@ -1618,7 +1692,6 @@ const Chat = {
     return p;
   },
 
-  /* Fast update — used in coding mode: full text appears immediately. */
   streamUpdateFast(idx, text){
     const el=document.querySelector(`.msg[data-idx="${idx}"] .bubble`);
     if(!el) return;
@@ -1627,17 +1700,15 @@ const Chat = {
     if(UI.nearBottom()) UI.scrollBottom();
   },
 
-  /* Line-by-line update — used in normal mode: text appears line by line. */
   streamUpdateLines(idx, text){
     const el=document.querySelector(`.msg[data-idx="${idx}"] .bubble`);
     if(!el) return;
-    // Only update when we get a full new line or the text grew significantly
     const prev = el.dataset.lastText || '';
     const newLines = (text.match(/\n/g)||[]).length;
     const oldLines = (prev.match(/\n/g)||[]).length;
     const grewByLine = newLines > oldLines;
     const grewSignificantly = (text.length - prev.length) > 40;
-    if(!grewByLine && !grewSignificantly && text.length < 60) return; // wait for first line
+    if(!grewByLine && !grewSignificantly && text.length < 60) return;
     el.dataset.lastText = text;
     el.textContent=text;
     if(!el.querySelector('.cursor')) el.insertAdjacentHTML('beforeend','<span class="cursor"></span>');
@@ -1900,14 +1971,12 @@ const Settings = {
     if(!apiKey && type!=='custom'){ UI.toast('API key required','err'); return; }
     if(!base && type==='custom'){ UI.toast('Base URL required','err'); return; }
 
-    // Build provisional provider
     let model = modelInput;
     let models = modelsRaw ? modelsRaw.split(',').map(s=>s.trim()).filter(Boolean) : (model ? [model] : []);
 
     const p = { id:'p_'+Date.now(), type, name, base, apiKey, model:model||'', models, enabled,
       caps:{vision:cap==='vision',reasoning:cap==='reasoning',coding:cap==='coding'}, created:Date.now() };
 
-    // Auto-detect free model if user left it blank
     if(!model){
       UI.toast('Detecting free model…');
       try{
@@ -2052,6 +2121,10 @@ const Settings = {
           <option value="de-DE" ${State.settings.voiceLang==='de-DE'?'selected':''}>German</option>
         </select>
       </div>
+      <div class="notice">
+        <b>Listen button</b><br>
+        When you tap Listen on an AI reply, ZISHU AI strips markdown, emojis, code blocks, and symbols — it speaks only natural text. Tap Listen again to stop.
+      </div>
       <button class="btn btn-ghost" onclick="Voice.speak('Hello, this is ZISHU AI.')">Test text-to-speech</button>`;
   },
 
@@ -2140,12 +2213,11 @@ window.addEventListener('online',()=>UI.toast('Back online','ok'));
 window.addEventListener('offline',()=>UI.toast('You are offline. Saved chats are still available.','err'));
 
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'){ Composer.closePlus(); Models.closeMenu(); Settings.close(); }
+  if(e.key==='Escape'){ Composer.closePlus(); Models.closeMenu(); Settings.close(); Voice.stopSpeaking(); }
   if(e.ctrlKey && e.key==='k'){ e.preventDefault(); document.getElementById('chat-search').focus(); }
   if(e.ctrlKey && e.key==='b'){ e.preventDefault(); UI.toggleSidebar(); }
 });
 
-/* ============ URL ROUTING ============ */
 function handleHashRoute(){
   const h=location.hash||'';
   const m=h.match(/^#\/chat\/(.+)$/);
@@ -2170,13 +2242,8 @@ async function init(){
   await loadAll();
   const migrated=await migrateLegacy();
   if(migrated) UI.toast('Imported chats from the old Stardust app','ok');
-
-  // System theme on first launch
-  if(State.settings.theme==='system'){
-    State.settings.theme = matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
-  }
+  if(State.settings.theme==='system') State.settings.theme = matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
   applyTheme(State.settings.theme);
-
   Composer.renderAttachments();
   handleHashRoute();
   Models.updatePill();
